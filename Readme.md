@@ -13,7 +13,6 @@ Both paths utilize **Kafka**, ensuring the user-facing API responds immediately 
 ## 1. Architecture
 
 
-![img.png](img.png)
 ```mermaid
 flowchart TB
     Client["Client / Postman / JMeter"]
@@ -81,9 +80,9 @@ The system successfully handled a sustained burst of **10,346 requests** in ~1 m
 | **POST /expense/v1/addExpense** (sync) | 5,110 | 0.00% | 14.78 | 10.00 | 20.00 | 25.00 | 42.00 | 85.46 |
 | **POST /v1/ds/message** (async) | 5,234 | 0.00% | 10.15 | 4.00 | 9.00 | 11.00 | 21.00 | 87.57 |
 | **Total** | 10,346 | 0.00% | 12.62 | 7.00 | 16.00 | 21.00 | 38.00 | 162.74 |
-![img_1.png](img_1.png)
-*Figure: JMeter HTML Dashboard confirming a 100% success rate and ultra-low latency across the asynchronous Kafka pipeline.*
 
+*Figure: JMeter HTML Dashboard confirming a 100% success rate and ultra-low latency across the asynchronous Kafka pipeline.*
+![img_1.png](img_1.png)
 **Key Takeaways:**
 The Kafka-decoupled path drastically outperformed the synchronous path under concurrent load, delivering **60% lower median latency (4ms vs 10ms)** and **50% lower P99 latency (21ms vs 42ms)**. This proves the direct payoff of not blocking the HTTP response thread on a MySQL round-trip.
 
