@@ -1,0 +1,101 @@
+_format_version: "3.0"
+_transform: true
+
+services:
+  # ---------- Auth Service ----------
+  - name: auth-service
+    url: http://auth-service:9898
+    routes:
+      - name: auth-public-route
+        paths:
+          - /auth/v1/login
+          - /auth/v1/refreshToken
+          - /auth/v1/signup
+        strip_path: false
+      - name: auth-health-route
+        paths:
+          - /auth/health
+        strip_path: true
+      - name: auth-protected-route
+        paths:
+          - /auth/v1/ping
+        strip_path: false
+        plugins:
+          - name: jwt
+            config:
+              claims_to_verify: [exp]
+              secret_is_base64: true    # Java signs with Decoders.BASE64.decode(SECRET) -> Kong must decode the same way
+
+  # ---------- User Service ----------
+  - name: user-service
+    url: http://user-service:9810
+    routes:
+      - name: user-health-route
+        paths:
+          - /user/health
+        strip_path: true
+      - name: user-protected-route
+        paths:
+          - /user/v1
+        strip_path: false
+        plugins:
+          - name: jwt
+            config:
+              claims_to_verify: [exp]
+              secret_is_base64: true    # Java signs with Decoders.BASE64.decode(SECRET) -> Kong must decode the same way
+
+  # ---------- Expense Service ----------
+  - name: expense-service
+    url: http://expense-service:9820
+    routes:
+      - name: expense-health-route
+        paths:
+          - /expense/health
+        strip_path: true
+      - name: expense-protected-route
+        paths:
+          - /expense/v1
+        strip_path: false
+        plugins:
+          - name: jwt
+            config:
+              claims_to_verify: [exp]
+              secret_is_base64: true    # Java signs with Decoders.BASE64.decode(SECRET) -> Kong must decode the same way
+
+  # ---------- DS Service (NLP -> Kafka producer) ----------
+  - name: ds-service
+    url: http://ds-service:8010
+    routes:
+      - name: ds-health-route
+        paths:
+          - /ds/health
+        strip_path: true
+      - name: ds-protected-route
+        paths:
+          - /v1/ds/message
+        strip_path: false
+        plugins:
+          - name: jwt
+            config:
+              claims_to_verify: [exp]
+              secret_is_base64: true    # Java signs with Decoders.BASE64.decode(SECRET) -> Kong must decode the same way
+
+consumers:
+  - username: expense-tracker-app
+    jwt_secrets:
+      - algorithm: HS256
+        key: expense-tracker-auth        # must match .setIssuer("expense-tracker-auth") in JwtService.java
+        secret: __JWT_SECRET__            # substituted at container start from the JWT_SECRET env var
+
+plugins:
+  - name: cors
+    config:
+      origins:
+        - "*"
+      methods: [GET, POST, PUT, DELETE, OPTIONS]
+      headers: [Accept, Authorization, Content-Type, X-User-Id, x-user-id]
+      credentials: true
+  - name: rate-limiting
+    config:
+      minute: 100000     # <-- raised from 300, load-testing needs headroom
+      policy: local

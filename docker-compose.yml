@@ -1,0 +1,229 @@
+name: expense-tracker-platform
+
+networks:
+  expense-tracker-net:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  kong-config:
+
+services:
+
+  # ==========================================================
+  # MySQL — single shared instance, 3 databases (init.sql)
+  # ==========================================================
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - expense-tracker-net
+
+  # ==========================================================
+  # Kafka — KRaft mode (no Zookeeper needed)
+  # Using confluentinc/cp-kafka since bitnami/kafka:3.7 is no
+  # longer a resolvable tag (Bitnami changed its tagging scheme).
+  # ==========================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.4.4
+    container_name: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Any fixed 22-char base64-ish string works — it just has to stay
+      # the same across restarts of this single node.
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - expense-tracker-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "8089:8080"
+    networks:
+      - expense-tracker-net
+
+  # ==========================================================
+  # Auth Service (port 9898) — signup/login/refresh, produces
+  # to Kafka topic "user_service"
+  # ==========================================================
+  auth-service:
+    build:
+      context: ./AuthService1
+    container_name: auth-service
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRATION: ${JWT_EXPIRATION}
+      REFRESH_TOKEN_EXPIRY: ${REFRESH_TOKEN_EXPIRY}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9898:9898"
+    networks:
+      - expense-tracker-net
+
+  # ==========================================================
+  # User Service (port 9810) — consumes "user_service" topic
+  # ==========================================================
+  user-service:
+    build:
+      context: ./Userservice
+    container_name: user-service
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+    ports:
+      - "9810:9810"
+    networks:
+      - expense-tracker-net
+
+  # ==========================================================
+  # Expense Service (port 9820) — consumes "expense_service"
+  # topic + exposes sync add/get endpoints
+  # ==========================================================
+  expense-service:
+    build:
+      context: ./expenseService
+    container_name: expense-service
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9820:9820"
+    networks:
+      - expense-tracker-net
+
+  # ==========================================================
+  # DS Service (port 8010) — Flask/NLP, produces to
+  # "expense_service" topic
+  # ==========================================================
+  ds-service:
+    build:
+      context: ./dsService-main
+    container_name: ds-service
+    restart: unless-stopped
+    environment:
+      KAFKA_HOST: ${KAFKA_HOST}
+      KAFKA_PORT: ${KAFKA_PORT}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8010:8010"
+    networks:
+      - expense-tracker-net
+
+  # ==========================================================
+  # Kong — API Gateway (DB-less / declarative mode)
+  # ==========================================================
+  kong-config-init:
+    image: alpine:3.20
+    container_name: kong-config-init
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+    volumes:
+      - ./kong:/kong-template:ro
+      - kong-config:/kong-config
+    entrypoint: ["sh", "/kong-template/render-config.sh"]
+
+  kong:
+    image: kong:3.9
+    container_name: kong
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong-config/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+    volumes:
+      - kong-config:/kong-config:ro
+    depends_on:
+      kong-config-init:
+        condition: service_completed_successfully
+      auth-service:
+        condition: service_started
+      user-service:
+        condition: service_started
+      expense-service:
+        condition: service_started
+      ds-service:
+        condition: service_started
+    ports:
+      - "8000:8000"   # proxy (this is what JMeter / your frontend hits)
+      - "8001:8001"   # admin API
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - expense-tracker-net

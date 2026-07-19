@@ -1,0 +1,30 @@
+.env
+*.log
+.DS_Store
+.idea/
+*.iml
+*.jtl
+report*/
+clean_report*/
+safe_report*/
+**/target/
+**/build/
+**/.venv/
+**/node_modules/
+ReadmePrev.md
+services.yml
+apache-jmeter-5.6.3/
+*.tgz
+apache-jmeter-*/
+**/bin/
+# Heavy Binaries and Zips
+
+*.zip
+*.jar
+
+# JMeter
+
+
+# Java/Spring Boot Build Folders
+**/.gradle/
+
