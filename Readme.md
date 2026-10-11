@@ -1,217 +1,322 @@
-# Expense Tracker — Microservices Platform
+# Expense Tracker Platform
 
-An event-driven expense tracking platform built as four independently deployable microservices, fronted by **Kong API Gateway**, wired together with **Apache Kafka** for asynchronous communication, and fully containerized via Docker.
+A full-stack, microservices-based expense tracking platform that combines Spring Boot services, a Python-based intelligence service, Kong API Gateway, Docker networking, and a custom authentication layer. This project is designed to demonstrate a realistic distributed architecture for modern backend systems, with clear separation of concerns between authentication, user management, expense processing, analytics, and API routing.
 
-A user can either:
-1. **Sign up / log in** through the Auth Service and get a JWT, or
-2. **Text a natural-language message** ("Spent 500 on groceries") to the DS Service, which uses a Mistral LLM to turn it into structured expense data.
-
-Both paths utilize **Kafka**, ensuring the user-facing API responds immediately while the database writes happen asynchronously in the background.
+This repository is a strong example of a production-style backend setup that can be used for learning, portfolio presentation, or real-world extension into a larger SaaS-style application.
 
 ---
 
-## 1. Architecture
+## 1. Project Overview
 
+The Expense Tracker Platform is built as a multi-service system where different responsibilities are handled by separate components:
+
+- Authentication and token-based access control are managed by the Auth service.
+- User profiles and identity-related operations are handled by the User service.
+- Expense-related business logic is processed separately through the Expense service.
+- A Python-based data service adds analytics or intelligent processing capabilities.
+- Kong acts as the API gateway and routes external requests to the correct internal service.
+- Docker is used to orchestrate the services and the shared network environment.
+
+The system is intended to showcase:
+
+- Microservices architecture
+- API gateway integration
+- Service-to-service communication
+- Docker-based deployment
+- Authentication and authorization flow
+- Event-driven communication with Kafka
+- Database-backed services with MySQL
+
+---
+
+## 2. Architecture
+
+The platform follows a layered and modular architecture:
 
 ```mermaid
-flowchart TB
-    Client["Client / Postman / JMeter"]
+flowchart LR
+    Client[Client / Postman / Browser] --> Kong[Kong Gateway]
+    Kong --> Auth[Auth Service]
+    Kong --> User[User Service]
+    Kong --> Expense[Expense Service]
+    Kong --> DS[DS Service]
 
-    subgraph Gateway["Kong API Gateway :8000"]
-        KongProxy["Proxy + JWT Plugin + CORS + Rate Limiting"]
-    end
-
-    Client --> KongProxy
-
-    KongProxy -->|"public: /auth/v1/login, /signup, /refreshToken"| Auth["Auth Service :9898\n(Spring Boot)"]
-    KongProxy -->|"JWT protected: /auth/v1/ping"| Auth
-    KongProxy -->|"JWT protected: /user/v1/*"| User["User Service :9810\n(Spring Boot)"]
-    KongProxy -->|"JWT protected: /expense/v1/*"| Expense["Expense Service :9820\n(Spring Boot)"]
-    KongProxy -->|"JWT protected: /v1/ds/message"| DS["DS Service :8010\n(Flask + Mistral LLM)"]
-
-    Auth -->|"produces"| K[("Kafka\ntopic: user_service")]
-    K -->|"consumes"| User
-    User --> UserDB[("MySQL\nuserservice")]
-    Auth --> AuthDB[("MySQL\nauthservice")]
-
-    DS -->|"produces"| K2[("Kafka\ntopic: expense_service")]
-    K2 -->|"consumes"| Expense
-    Expense --> ExpenseDB[("MySQL\nexpenseservice")]
-    Expense -.->|"sync path: direct write"| ExpenseDB
+    Auth --> DB[(MySQL)]
+    User --> DB[(MySQL)]
+    Expense --> DB[(MySQL)]
+    Auth --> Kafka[(Kafka)]
+    User --> Kafka[(Kafka)]
+    Expense --> Kafka[(Kafka)]
+    DS --> Kafka[(Kafka)]
 ```
 
-### What each service does
+### High-Level Flow
 
-| Service | Tech | Port | Owns DB | Role |
-|---|---|---|---|---|
-| **Kong** | kong:3.9, DB-less | 8000 | — | Single entry point. Routes public vs JWT-secured traffic; enforces CORS + rate limiting. |
-| **AuthService1** | Java 21 / Spring Boot 3.4 | 9898 | `authservice` | Signup, login, JWT + refresh-token issuance. Publishes a `UserInfoEvent` to Kafka topic `user_service`. |
-| **Userservice** | Java 21 / Spring Boot 4.0 | 9810 | `userservice` | Consumes `user_service` topic to create/update user profiles. Exposes REST endpoints. |
-| **expenseService** | Java 21 / Spring Boot 4.0 | 9820 | `expenseservice`| Consumes `expense_service` topic to persist expenses. Also exposes a **synchronous** `addExpense` REST API that writes directly to MySQL. |
-| **dsService** | Python 3.11 / Flask | 8010 | — | Parses free-text messages via Mistral LLM (LangChain) into structured `{amount, merchant, currency}` data, publishes to `expense_service`. |
-| **MySQL** | MySQL 8.0 | 3306 | — | One shared instance, 3 isolated databases. |
-| **Kafka** | Bitnami Kafka 3.7 | 9092 | — | KRaft mode (single node). Decouples producers/consumers. |
+1. A client sends a request to the Kong gateway.
+2. Kong routes the request based on its configuration.
+3. The target service handles the corresponding business logic.
+4. Services interact with MySQL for persistence and Kafka for event-driven communication.
+5. The data/analytics service consumes or processes relevant data as part of the broader workflow.
 
 ---
 
-## 2. Why Kafka / Async Decoupling Here?
+## 3. Main Components
 
-Two genuinely different endpoints exist for creating an expense, which makes an honest architectural comparison possible:
-*   `/expense/v1/addExpense` — **Synchronous**, writes straight to MySQL on the request thread.
-*   `/v1/ds/message` — **Asynchronous**, the HTTP response only waits on the Kafka producer accepting the message; the DB write happens later, off-thread.
+### Auth Service
 
-The honest story to tell is about **resilience and throughput under load**. A single call to `/v1/ds/message` pays for an outbound LLM API call, so on its own, it's not the faster endpoint. What Kafka buys you shows up as concurrency rises:
-*   The synchronous path's latency climbs once MySQL connections (HikariCP pool) become contended.
-*   The asynchronous path keeps accepting requests at a flat latency. A burst just grows Kafka consumer lag instead of timing out user-facing requests.
-*   If the database goes down entirely, the direct write fails immediately, but the async path safely queues the data in Kafka and resumes persisting once the DB recovers.
+The Auth service is responsible for authentication, token generation, and secured access for protected endpoints.
 
----
+Key responsibilities:
+- User sign-in and authentication flow
+- JWT-based access handling
+- Secure communication with the database
+- Integration with the gateway layer
 
-## 3. 🚀 Performance & Load Testing
-
-To benchmark the raw performance of the internal event-driven pipeline, the Mistral AI integration was temporarily bypassed with a deterministic mock. This allowed for an isolated stress test of the core pipeline: **Kong -> Flask -> Kafka -> Spring Boot -> MySQL** using **Apache JMeter**.
-
-### Load Test Results
-
-The system successfully handled a sustained burst of **10,346 requests** in ~1 minute with **zero dropped connections (0.00% error rate)**.
-
-| Endpoint | Samples | Error % | Avg (ms) | Median (ms) | 90th pct | 95th pct | 99th pct | Throughput (req/s) |
-|---|---|---|---|---|---|---|---|---|
-| **POST /expense/v1/addExpense** (sync) | 5,110 | 0.00% | 14.78 | 10.00 | 20.00 | 25.00 | 42.00 | 85.46 |
-| **POST /v1/ds/message** (async) | 5,234 | 0.00% | 10.15 | 4.00 | 9.00 | 11.00 | 21.00 | 87.57 |
-| **Total** | 10,346 | 0.00% | 12.62 | 7.00 | 16.00 | 21.00 | 38.00 | 162.74 |
-
-*Figure: JMeter HTML Dashboard confirming a 100% success rate and ultra-low latency across the asynchronous Kafka pipeline.*
-![img_1.png](img_1.png)
-**Key Takeaways:**
-The Kafka-decoupled path drastically outperformed the synchronous path under concurrent load, delivering **60% lower median latency (4ms vs 10ms)** and **50% lower P99 latency (21ms vs 42ms)**. This proves the direct payoff of not blocking the HTTP response thread on a MySQL round-trip.
+Technology highlights:
+- Java
+- Spring Boot
+- Spring Security
+- JWT
+- MySQL
+- Kafka
 
 ---
 
-## 4. Data Flow Walkthroughs
+### User Service
 
-**1. Signup (Async fan-out):**
-`POST /auth/v1/signup` → AuthService writes credentials to `authservice.users` synchronously → publishes a `UserInfoEvent` (JSON) to Kafka topic `user_service` → Userservice consumes it independently and writes the profile row. The HTTP response to the client does not wait on the second write.
+The User service handles user-related operations and provides the backend logic for user identity and profile management.
 
-**2. Natural-language expense entry (Fully async):**
-`POST /v1/ds/message` → dsService calls Mistral via LangChain → extracts `{amount, merchant, currency}` → publishes to Kafka topic `expense_service` → expenseService consumer persists it to `expenseservice.expense`. The client gets a 200 OK immediately.
+Key responsibilities:
+- User creation and management
+- User-specific data handling
+- Integration with shared infrastructure services
+- Interaction with Kafka when user events are propagated
 
-**3. Direct expense entry (Sync, for comparison):**
-`POST /expense/v1/addExpense` → expenseService controller → service layer → `expenseRepository.save()` blocks the request thread on a MySQL round trip → response. No queue involved.
-
----
-
-## 5. Security Model (Kong API Gateway)
-
-| Route | Auth required? | Notes |
-|---|---|---|
-| `POST /auth/v1/signup` | ❌ Public | |
-| `POST /auth/v1/login` | ❌ Public | |
-| `GET /auth/v1/ping` | ✅ JWT | Sanity-check an issued token |
-| `/user/v1/*` | ✅ JWT | Backend services do **not** check JWTs — Kong is the sole enforcement point |
-| `/expense/v1/*` | ✅ JWT | |
-| `POST /v1/ds/message` | ✅ JWT | |
-
-"JWT required" means Kong itself verifies the token's HS256 signature and expiry **before the request ever reaches the services** — a forged or expired token gets a 401 straight from the gateway.
-
-JWTs are signed **HS256** by AuthService using a base64 `JWT_SECRET`. Kong's `jwt` plugin is configured with `secret_is_base64: true` to decode the exact same key before verifying. AuthService also stamps every token with `iss: expense-tracker-auth`, which is how Kong knows which secret to check against.
+Technology highlights:
+- Java
+- Spring Boot
+- JPA / Hibernate
+- MySQL
+- Kafka
 
 ---
 
-## 6. Project Structure
+### Expense Service
 
-This orchestrator repository flattens all 4 services as siblings so a single `docker-compose.yml` can build everything:
+The Expense service manages expense-related business logic and is designed to be a core domain service within the system.
+
+Key responsibilities:
+- Expense creation and updates
+- Domain-specific business rules
+- Persistence in the database
+- Event communication across services
+
+Technology highlights:
+- Java
+- Spring Boot
+- MySQL
+- Kafka
+
+---
+
+### DS Service
+
+The DS service is a Python-based service that adds data or intelligence capabilities to the platform.
+
+Key responsibilities:
+- Processing or analysis of data
+- Integration with LLM / AI-related workflows where applicable
+- Communication with the broader service ecosystem
+
+Technology highlights:
+- Python
+- Flask
+- LangChain / OpenAI-compatible tooling
+- Docker-ready deployment
+
+---
+
+### Kong API Gateway
+
+Kong is used as the API entry point for the whole system. It provides request routing, centralized exposure, and plugin-based custom authentication.
+
+Key responsibilities:
+- Routing incoming APIs to the appropriate service
+- Enforcing gateway-level policies
+- Supporting custom authentication plugins
+- Centralizing access to the platform
+
+Technology highlights:
+- Kong Gateway
+- Declarative config
+- Custom Lua-based plugin support
+
+---
+
+## 4. Technology Stack
+
+### Backend
+- Java 21
+- Spring Boot
+- Spring Security
+- Spring Data JPA
+- Spring Kafka
+- JWT
+
+### Data Layer
+- MySQL
+- Kafka
+- Zookeeper
+
+### Gateway / Infra
+- Kong
+- Docker
+- Docker Compose
+
+### Intelligence Layer
+- Python
+- Flask
+- LangChain / OpenAI-compatible packages
+
+---
+
+## 5. Repository Structure
 
 ```text
-expense-tracker-platform/            <- orchestrator repo
-├── docker-compose.yml
-├── .env.example                     <- copy to .env and fill in
-├── kong/
-│   └── kong.yml.template            <- rendered to kong.yml at container start
-├── mysql-init/
-│   └── init.sql                     <- creates the 3 databases on first boot
-├── jmeter/
-│   └── expense-tracker-load-test.jmx
-├── Expenese-Tracker-main/           
-│   ├── AuthService1/
-│   │   ├── Dockerfile               <- NEW
-│   │   └── app/src/main/resources/application.properties   <- NEW
-│   └── Userservice/
-│       ├── Dockerfile               <- NEW
-│       └── src/main/resources/application.properties       <- NEW
-├── expenseService-main/             
-│   ├── Dockerfile                   <- NEW
-│   └── src/main/resources/application.properties           <- NEW
-└── dsService-main/                  
-    └── Dockerfile                   <- REPLACED
+EXPENSE_TRACKER/
+├── AuthService1/            # Authentication service
+├── Userservice/             # User service
+├── dsService-main/          # Python-based data/intelligence service
+├── config/                  # Kong declarative config
+├── custom-plugins/          # Kong custom auth plugin files
+├── docs/                    # Documentation and setup notes
+├── services.yml             # Docker Compose service orchestration
+├── kong.yml                 # Kong config file
+└── Readme.md                # Project documentation
 ```
 
 ---
 
-## 7. One-Time Setup & Execution
+## 6. Docker and Network Setup
+
+The project is designed to run in a shared Docker network with the following major services:
+
+- Zookeeper
+- Kafka
+- MySQL
+- Auth Service
+- User Service
+- Expense Service
+- DS Service
+- Kong Gateway
+
+This setup makes the platform behave like a realistic distributed system where services are loosely coupled and communicate through a common internal network.
+
+### Start the environment
+
+From the repository root, run:
+
+```bash
+docker compose -f services.yml up -d
+```
+
+### Stop the environment
+
+```bash
+docker compose -f services.yml down
+```
+
+---
+
+## 7. Local Development Setup
 
 ### Prerequisites
-- Docker + Docker Compose v2
-- A free [Mistral API key](https://console.mistral.ai)
 
-### Steps
-1. **Environment Variables:** Copy `.env.example` to `.env` and configure:
-   ```bash
-   cp .env.example .env
-   ```
-   *Generate a valid Base64 JWT_SECRET using:*
-   ```bash
-   python3 -c "import base64,os; print(base64.b64encode(os.urandom(32)).decode())"
-   ```
+Make sure the following are available:
+- Docker Desktop / Docker Engine
+- Java 21
+- Python 3.x
+- Gradle wrapper available in the Java service folders
 
-2. **Run Everything:**
-   ```bash
-   docker compose up --build
-   ```
-   *(First boot takes 1-2 minutes for Kafka to elect a controller and Java services to build).*
+### Run the Java services
 
-3. **Verify Health:**
-   ```bash
-   docker compose ps
-   ```
+For the Spring Boot services, use the Gradle wrapper in each project folder:
 
-### Access Points
-*   **API Gateway (Use this for traffic):** `http://localhost:8000`
-*   **Kong Admin API:** `http://localhost:8001`
-*   **Kafka UI (View topics/lag):** `http://localhost:8089`
+```bash
+cd AuthService1
+./gradlew bootRun
+```
 
----
+```bash
+cd Userservice
+./gradlew bootRun
+```
 
-## 8. Environment Variables Reference
+### Run the Python service
 
-| Variable | Used by | Purpose |
-|---|---|---|
-| `DB_PASSWORD` | mysql, auth, user, expense | Shared MySQL root password |
-| `JWT_SECRET` | auth-service, Kong | Base64 HS256 signing key — **must match on both sides** |
-| `JWT_EXPIRATION` | auth-service | Access token lifetime, ms |
-| `MISTRAL_API_KEY` | ds-service | LLM API key |
+```bash
+cd dsService-main
+python -m venv dsenv
+source dsenv/Scripts/activate
+pip install -r requirements.txt
+python setup.py sdist
+```
+
+If the service uses Flask or other runtime entry points, run them from the service folder after installing dependencies.
 
 ---
 
-## 9. Changes Made & Known Quirks
+## 8. API Gateway Access
 
-**Changes Made to Original Repositories:**
-1. **Added `application.properties` (Env-Driven):** Removed hardcoded configs. Services now rely on `.env` injected via Docker.
-2. **Replaced dsService Dockerfile:** Switched from `python setup.py sdist` to a direct `pip install .` to fix missing `kafka-python`/`python-dotenv` dependencies at boot.
-3. **Added JWT Issuer:** Added `.setIssuer("expense-tracker-auth")` in AuthService. Kong requires an `iss` claim to map the token to the correct consumer secret.
+Once the services are running, Kong acts as the entry point for the platform.
 
-**Known Quirks (Worth Mentioning for Interviews):**
-*   **Misleading LLM Key Name:** `dsService` reads `OPENAI_API_KEY` from the environment but passes it to `ChatMistralAI`. It is actually a Mistral key.
-*   **Trusted `X-User-Id`:** Services read the user ID from a client-provided header rather than strictly extracting it from the JWT `sub` claim. A future enhancement would be using a Kong request-transformer plugin to overwrite this header using the verified JWT.
-*   **Inconsistent `/health` Namespaces:** Services expose differing health check paths (e.g., bare `/health` vs `/expense/v1/health`). These are handled internally by Docker networking rather than the Kong Gateway to avoid path collisions.
+Typical entry points:
+- Gateway port: 8000
+- Admin port: 7990 (depending on configuration)
+
+You can use Kong to route calls to the appropriate backend service based on the declared routes and plugins.
 
 ---
 
-## 10. Troubleshooting
+## 9. Documentation
 
-| Symptom | Likely cause |
-|---|---|
-| Everything 401s at gateway | `JWT_SECRET` in `.env` doesn't match what Kong rendered. Run: `docker compose up -d --force-recreate kong-config-init kong` |
-| Java service keeps restarting | MySQL isn't healthy yet, or a typo in `.env` database credentials. |
-| dsService fails on startup | Check `MISTRAL_API_KEY` is set in `.env` — an empty key fails on the first request. |
-| Kafka port 9092 unreachable | `kafka:9092` is only resolvable *inside* the Docker network. Use Kafka UI at `:8089` to inspect topics from the host machine. |
+Additional notes and supporting documentation are located in the docs folder:
+
+- API gateway references
+- Docker-related notes
+- Debugging guides
+- Setup and environment help
+
+The docs folder is useful for understanding the architecture in more detail and for troubleshooting common development issues.
+
+---
+
+## 10. Why This Project Is Valuable
+
+This repository is not just a simple CRUD app. It demonstrates a more professional and realistic engineering structure:
+
+- Distributed backend services
+- API gateway pattern
+- Secure authentication design
+- Dockerized deployment
+- Multi-language service ecosystem
+- Strong portfolio-ready architecture
+
+It is a great project to showcase if you want to demonstrate skills in:
+- Backend development
+- Microservices architecture
+- DevOps and containerization
+- API gateway concepts
+- Full-stack system thinking
+
+---
+
+## 11. Summary
+
+The Expense Tracker Platform is a comprehensive example of a modern backend architecture that combines multiple services into one cohesive system. It is built to be educational, extensible, and impressive for technical review, internship interviews, job applications, or portfolio presentation.
+
+If you want, the next step can be to add:
+- a proper architecture diagram image
+- a setup guide with screenshots
+- a demo API collection
+- deployment instructions for a cloud environment
